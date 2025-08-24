@@ -111,7 +111,11 @@ def predict_with_shap(request_data: PredictionRequest):
 
     # 3.6. 특성 순서 맞추기 (매우 중요)
     final_input_df = final_df.reindex(columns=feature_names, fill_value=0)
+    final_input_df = final_input_df.drop('loan_status', axis=1)
     input_data_np = final_input_df.values
+
+    print("Print model input data")
+    print(final_input_df.info())
 
     # 3.7. 모델 예측 및 SHAP 값 계산
     prediction = model.predict(input_data_np)[0]
