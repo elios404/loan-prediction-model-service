@@ -1,78 +1,123 @@
-# from fastapi import FastAPI
-# # fastapi는 8000번 포트 사용
-
-# # FastAPI 앱 인스턴스 생성
-# app = FastAPI()
-
-# # 루트 경로('/')에 대한 GET 요청 처리
-# @app.get("/")
-# def read_root():
-#     return {"message": "Hello World"}
-
 import joblib
 import numpy as np
+import pandas as pd
 import shap
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import os
 
 # FastAPI 앱 인스턴스 생성
 app = FastAPI()
 
-# 1. Spring에서 받을 JSON 데이터의 형식을 정의합니다.
-# Pydantic을 사용하여 데이터 유효성 검사를 자동으로 처리할 수 있습니다.
+# 1. Spring에서 받을 원본 데이터의 형식을 정의합니다.
+# Pydantic의 Field(alias=...)를 사용하여 카멜 케이스 변수명을 매핑합니다.
 class PredictionRequest(BaseModel):
-    # Spring에서 보낼 데이터의 특성 이름과 타입을 정의합니다.
-    # 여기서는 예시로 'feature1', 'feature2', 'feature3'를 사용합니다.
-    feature1: float
-    feature2: float
-    feature3: float
+    user_id: int = Field(..., alias="userId")
+    name: str
+    age: float
+    gender: int
+    education: str
+    home_ownership: str = Field(..., alias="homeOwnership")
 
-# 2. 모델과 SHAP Explainer를 로드합니다.
-# 실제 프로젝트에서는 모델을 미리 학습시켜 my_model.pkl 파일로 저장해야 합니다.
-try:
-    # 예시 모델 로드 (실제 모델 파일 경로로 변경 필요)
-    model = joblib.load("model/xgb_model_log.pkl")
+    # 금융 정보
+    loan_id: int = Field(..., alias="loanId")
+    income: float
+    emp_exp: int = Field(..., alias="empExp")
+    amount: float
+    intent: str
+    int_rate: float = Field(..., alias="intRate")
+    loan_percent_income: float = Field(..., alias="loanPercentIncome")
+    cred_hist_length: float = Field(..., alias="credHistLength")
+    credit_score: int = Field(..., alias="creditScore")
+    previous_loan_defaults: int = Field(..., alias="previousLoanDefaults")
+    # loan_status: int = Field(..., alias="loanStatus")
+
+    class Config:
+        populate_by_name = True
+
+# 2. 모델, 인코더, Explainer를 전역 변수로 선언
+model = None
+encoder = None
+explainer = None
+feature_names = None
+
+# FastAPI 서버가 시작될 때 실행되는 이벤트 핸들러
+@app.on_event("startup")
+async def load_resources():
+    """
+    서버 시작 시 모델, 인코더, Explainer를 로드합니다.
+    """
+    global model, encoder, explainer, feature_names
     
-    # SHAP Explainer 객체 생성 (모델과 학습 데이터로 생성)
-    # SHAP explainer를 생성하기 위한 예시 데이터 (모델 학습에 사용된 데이터와 유사해야 함)
-    # 실제로는 학습 데이터셋을 로드하여 사용해야 합니다.
-    dummy_data = np.array([[10, 20, 30], [15, 25, 35], [5, 10, 15]])
-    explainer = shap.Explainer(model, dummy_data)
-except FileNotFoundError:
-    # 모델 파일이 없을 경우 더미 모델과 explainer를 생성합니다.
-    print("모델 파일을 찾을 수 없습니다. 예시 더미 모델을 사용합니다.")
-    from sklearn.linear_model import LinearRegression
-    model = LinearRegression()
-    # 더미 데이터로 모델 학습
-    X_train = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-    y_train = np.array([10, 20, 30])
-    model.fit(X_train, y_train)
-    dummy_data = X_train
-    explainer = shap.Explainer(model, dummy_data)
-    
-# 3. 새로운 API 엔드포인트를 정의합니다.
+    try:
+        # 파일 경로 설정
+        model_path = os.path.join("model", "xgb_model_log.pkl")
+        encoder_path = os.path.join("model", "ohe_encoder.pkl")
+        train_data_path = os.path.join("data", "model_data_encoded.csv")
+        
+        # 2.1. 학습된 모델 및 OneHotEncoder 객체 로드
+        model = joblib.load(model_path)
+        encoder = joblib.load(encoder_path)
+        
+        # 2.2. SHAP Explainer를 위한 데이터셋 로드
+        df_train_encoded = pd.read_csv(train_data_path) 
+        
+        # 2.3. 모델 학습 시 사용한 특성 순서 정의
+        feature_names = df_train_encoded.columns.tolist()
+        
+        # 2.4. SHAP Explainer 객체 생성
+        explainer = shap.TreeExplainer(model)
+        explainer.feature_names = feature_names
+        
+        print("필요한 모든 객체 로드 완료.")
+        
+    except FileNotFoundError as e:
+        print(f"오류: {e}. 필요한 파일이 존재하지 않습니다. 서버를 시작할 수 없습니다.")
+        raise RuntimeError("서버 시작 실패: 필수 파일 누락.")
+    except Exception as e:
+        print(f"객체 로드 중 예상치 못한 오류 발생: {e}")
+        raise
+
+# 3. API 엔드포인트 정의
 @app.post("/predict_and_explain")
 def predict_with_shap(request_data: PredictionRequest):
     """
-    Spring에서 JSON 데이터를 받아 예측을 수행하고 SHAP 값을 반환합니다.
+    Spring에서 원본 데이터를 받아 전처리, 예측 및 SHAP 값을 반환합니다.
     """
-    # 4. JSON 데이터를 NumPy 배열로 변환합니다.
-    # Pydantic 모델의 데이터를 딕셔너리로 변환 후, 값을 추출하여 2차원 배열로 만듭니다.
-    input_data = np.array([[
-        request_data.feature1,
-        request_data.feature2,
-        request_data.feature3
-    ]])
 
-    # 5. 모델로 예측을 수행합니다.
-    prediction = model.predict(input_data)[0]
+    print("Received JSON from Spring Boot:")
+    print(request_data.model_dump_json(indent=2))
 
-    # 6. SHAP 값을 계산합니다.
-    shap_values = explainer.shap_values(input_data)[0]
+    # 3.1. Spring에서 받은 데이터를 DataFrame으로 변환
+    input_df = pd.DataFrame([request_data.model_dump(by_alias=False)])
+    
+    # 3.2. 로그 변환 수행
+    input_df['income'] = np.log1p(input_df['income'])
 
-    # 7. 응답을 위한 JSON 데이터를 구성합니다.
-    # 예측 결과와 SHAP 값을 함께 반환합니다.
-    # SHAP 값은 numpy.ndarray이므로 list로 변환해야 JSON으로 직렬화할 수 있습니다.
+    # 3.3. 원핫 인코딩 수행
+    categorical_features = ['education', 'home_ownership', 'intent']
+    encoded_features = encoder.transform(input_df[categorical_features])
+    
+    # 3.4. 인코딩된 데이터를 DataFrame으로 변환
+    encoded_df = pd.DataFrame(
+        encoded_features,
+        columns=encoder.get_feature_names_out(categorical_features)
+    )
+
+    # 3.5. 최종 입력 데이터 구성
+    # 원본 데이터의 수치형 특성과 인코딩된 범주형 특성을 병합
+    numerical_features = ['age', 'gender', 'emp_exp', 'amount', 'int_rate', 'loan_percent_income', 'cred_hist_length', 'credit_score', 'previous_loan_defaults']
+    final_df = pd.concat([input_df[['income']], input_df[numerical_features], encoded_df], axis=1)
+
+    # 3.6. 특성 순서 맞추기 (매우 중요)
+    final_input_df = final_df.reindex(columns=feature_names, fill_value=0)
+    input_data_np = final_input_df.values
+
+    # 3.7. 모델 예측 및 SHAP 값 계산
+    prediction = model.predict(input_data_np)[0]
+    shap_values = explainer.shap_values(input_data_np)[0]
+
+    # 3.8. 응답 데이터 구성 및 반환
     response_data = {
         "prediction": float(prediction),
         "shap_values": shap_values.tolist()
