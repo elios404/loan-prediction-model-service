@@ -1,2 +1,4 @@
 __pycache__
 loan_data.csv
+.env
+.vscode

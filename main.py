@@ -5,6 +5,14 @@ import shap
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import os
+import json
+
+# gpt 활용 코드
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+api_key = os.getenv('OPENAI_API_KEY')
 
 # FastAPI 앱 인스턴스 생성
 app = FastAPI()
@@ -40,6 +48,16 @@ model = None
 encoder = None
 explainer = None
 feature_names = None
+
+# openAI 모델
+client = OpenAI(api_key=api_key)
+
+def get_ai_response(messages):
+    response = client.chat.completions.create(
+        model='gpt-5-mini', 
+        messages=messages,
+    )
+    return response.choices[0].message.content
 
 # FastAPI 서버가 시작될 때 실행되는 이벤트 핸들러
 @app.on_event("startup")
@@ -86,7 +104,8 @@ def predict_with_shap(request_data: PredictionRequest):
     """
 
     print("Received JSON from Spring Boot:")
-    print(request_data.model_dump_json(indent=2))
+    input_data = request_data.model_dump_json(indent=2)
+    print(input_data)
 
     # 3.1. Spring에서 받은 데이터를 DataFrame으로 변환
     input_df = pd.DataFrame([request_data.model_dump(by_alias=False)])
@@ -121,10 +140,50 @@ def predict_with_shap(request_data: PredictionRequest):
     prediction = model.predict(input_data_np)[0]
     shap_values = explainer.shap_values(input_data_np)[0]
 
+    # 3.8 GPT 활용 SHAP 값에 대한 설명 받기
+    shap_col_names = [name for name in feature_names if name != 'loan_status']
+    messages = [
+        {'role' : 'system', 'content' : f"""
+너는 대출평가 결과를 분석하는 금융 전문가야. 앞으로 XGBoost로 학습한 모델에 대해서 데이터를 넣고 그 예측에 대한 SHAP 값이 주어질 때,
+어떤 특성이 긍정적인 영향이 있고, 어떤 특성이 부정적인 영향을 미쳤는지 이 대출 평가를 진행한 사람에게 설명해 줄거야.
+
+먼저 실제 모델에 입력된 정보는 다음과 같아.
+{input_data}
+
+'education', 'home_ownership', 'intent' 3가지 열에 대해서는 원 핫 인코딩이 진행되었어. SHAP를 해석할 때 이 부분에 맞춰서 해석해 주어야 해.
+
+Shap 값 numpy 리스트에 대해서 각 열의 이름과 순서는 다음과 같아.
+[Shap_col_names]
+{shap_col_names}
+
+이 순서에 맞춘 Shap_values는 다음과 같아. Shap Value 값은 숫자의 리스트로 들어갈거야.
+[Shap_values]
+{shap_values}
+
+답변은 json 형태로 출력해야해. 반드시
+json 안에 필요한 key : value는 다음과 같아.
+그리고 value 값에 들어간 설명을 작성할 때는 shap_col_names를 직접적으로 작성하면 안돼고 그것을 한글로 해석한 의미로 작성해야해.
+또한 긍정적인 요인과 부정적인 요인에 이번 케이스에 활성 카테고리가 아닌 경우, 예를 들어 주택 여부가 RENT 인데, OWN 이 부정적인 영향을 미친 경구 같은 상황에서
+활성 카테고리가 아닌 경우, 그것은 제외하고 활성 카테고리 인 것 중에서 긍정적인 것 부정적인 것을 선택해야해.
+
+first_positive : 가장 긍정적인 영향을 준 요소에 대한 2줄 정도의 설명
+second_positive : 2번째로 긍정적인 영향을 준 요소에 대한 2줄 정도의 설명
+first_negative : 가장 부정적인 영향을 준 요소에 대한 2줄 정도의 설명
+second_negative : 2번째로 부정적인 영향을 준 요소에 대한 2줄 정도의 설명
+comment : 입력된 정보를 기반으로 어떤 점을 보완하면 대출 가능성이 더 높아질지에 대한 총평 2줄 정도      
+"""
+        },
+        {'role' : 'user', 'content' : '주어진 정보를 바탕으로 shap 값을 해석하고 나에게 설명해줘.'}
+    ]
+
+    ai_response = get_ai_response(messages)
+    ai_response_json = json.loads(ai_response)
+
     # 3.8. 응답 데이터 구성 및 반환
     response_data = {
         "prediction": float(prediction),
-        "shap_values": shap_values.tolist()
+        # "shap_values": shap_values.tolist()
+        "shap_values" : ai_response_json
     }
     
     return response_data
